@@ -1,0 +1,140 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit, explode, array, col, concat_ws, when
+from pyspark.sql.types import FloatType, StructType, StructField, StringType, IntegerType, DateType, DoubleType
+from pyspark import StorageLevel
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+
+class HealthCampDataProcessor:
+    def __init__(self, spark):
+        self.spark = spark
+        self.Health_Detail_df = None
+        self.Health_Attended_df = None
+        self.Patient_Profile_df = None
+        self.transformed_df = None
+        self.model = None
+
+    def load_data(self, health_detail_path, health_attended_path, patient_profile_path):
+        health_detail_schema = StructType([
+            StructField("Health_Camp_ID", StringType(), True),
+            StructField("Camp_Start_Date", StringType(), True),
+            StructField("Camp_End_Date", StringType(), True),
+            StructField("Category1", StringType(), True),
+            StructField("Category2", StringType(), True),
+            StructField("Category3", IntegerType(), True)
+        ])
+        health_attended_schema = StructType([
+            StructField("Patient_ID", StringType(), True),
+            StructField("Health_Camp_ID", StringType(), True),
+            StructField("Donation", IntegerType(), True),
+            StructField("Health_Score", FloatType(), True)
+        ])
+        patient_profile_schema = StructType([
+            StructField("Patient_ID", StringType(), True),
+            StructField("Online_Follower", IntegerType(), True),
+            StructField("LinkedIn_Shared", IntegerType(), True),
+            StructField("Twitter_Shared", IntegerType(), True),
+            StructField("Facebook_Shared", IntegerType(), True),
+            StructField("Income", IntegerType(), True),
+            StructField("Education_Score", StringType(), True),
+            StructField("Age", IntegerType(), True),
+            StructField("First_Interaction", StringType(), True),
+            StructField("City_Type", StringType(), True),
+            StructField("Employer_Category", StringType(), True)
+        ])
+        self.Health_Detail_df = self.spark.read.schema(health_detail_schema).option("header", "true").csv(health_detail_path)
+        self.Health_Attended_df = self.spark.read.schema(health_attended_schema).option("header", "true").csv(health_attended_path)
+        self.Patient_Profile_df = self.spark.read.schema(patient_profile_schema).option("header", "true").csv(patient_profile_path)
+
+        self.Health_Detail_df.cache()
+        self.Health_Attended_df.cache()
+        self.Patient_Profile_df.cache()
+
+    def transform_data(self):
+        self.Health_Detail_df = self.Health_Detail_df.withColumn("Status", lit("Active"))
+
+        self.Patient_Profile_df = self.Patient_Profile_df.withColumn("Social_Media_Shares", explode(array("Online_Follower", "LinkedIn_Shared", "Twitter_Shared", "Facebook_Shared")))
+
+        self.Patient_Profile_df = self.Patient_Profile_df.fillna({'Income': 0})
+
+        income_level_rdd = self.Patient_Profile_df.rdd.map(lambda row: row + ("High" if row.Income > 2 else "Low",))
+        self.Patient_Profile_df = income_level_rdd.toDF(self.Patient_Profile_df.columns + ["Income_Level"])
+
+        self.Patient_Profile_df.persist(StorageLevel.MEMORY_AND_DISK)
+
+        combined_df = self.Health_Attended_df.join(self.Health_Detail_df, "Health_Camp_ID") \
+                                             .join(self.Patient_Profile_df, "Patient_ID")
+
+        combined_df.persist(StorageLevel.MEMORY_AND_DISK)
+
+        self.transformed_df = combined_df.select(
+            col("Health_Camp_ID"),
+            col("Patient_ID"),
+            col("Donation"),
+            col("Health_Score"),
+            col("Camp_Start_Date"),
+            col("Camp_End_Date"),
+            col("Category1"),
+            col("Category2"),
+            col("Category3"),
+            col("Status"),
+            col("Age"),
+            col("Income_Level"),
+            col("Social_Media_Shares"),
+            concat_ws(" ", col("Employer_Category"), col("City_Type")).alias("Employer_City")
+        )
+
+    def write_to_table(self, table_name):
+        self.transformed_df.write.mode("overwrite").parquet(table_name)
+
+    def prepare_ml_data(self):
+        # machine learning
+        ml_df = self.transformed_df.withColumn("Donation_Label", (col("Donation") > 20).cast(IntegerType()))
+		
+        feature_columns = ["Health_Score", "Age", "Category3", "Social_Media_Shares"]
+        assembler = VectorAssembler(inputCols=feature_columns, outputCol="features")
+        ml_df = assembler.transform(ml_df)
+
+        return ml_df
+
+    def train_model(self, train_df):
+
+        lr = LogisticRegression(labelCol="Donation_Label", featuresCol="features")
+        
+        self.model = lr.fit(train_df)
+
+    def evaluate_model(self, test_df):
+
+        predictions = self.model.transform(test_df)
+        
+        evaluator = BinaryClassificationEvaluator(labelCol="Donation_Label")
+        accuracy = evaluator.evaluate(predictions)
+
+        return accuracy, predictions
+
+    def run(self, health_detail_path, health_attended_path, patient_profile_path, table_name):
+        self.load_data(health_detail_path, health_attended_path, patient_profile_path)
+        self.transform_data()
+        self.write_to_table(table_name)
+        
+        ml_df = self.prepare_ml_data()
+        train_df, test_df = ml_df.randomSplit([0.7, 0.3], seed=42)
+        
+        self.train_model(train_df)
+        accuracy, predictions = self.evaluate_model(test_df)
+        
+        print(f"Model Accuracy: {accuracy}")
+        predictions.select("Health_Camp_ID", "Patient_ID", "Donation", "Donation_Label", "prediction", "probability").show()
+
+spark = SparkSession.builder \
+    .appName("Health Camp Data Transformation with ML") \
+    .getOrCreate()
+
+health_attended_path = '/mnt/healthrawdata/healthcampattend/First_Health_Camp_Attended.csv'
+health_detail_path = '/mnt/healthrawdata/healthcampdetail/Health_Camp_Detail.csv'
+patient_profile_path = '/mnt/healthrawdata/patientprofile/Patient_Profile.csv'
+
+processor = HealthCampDataProcessor(spark)
+
+processor.run(health_detail_path, health_attended_path, patient_profile_path, "/mnt/healthcurateddata/final_df_parquet")
